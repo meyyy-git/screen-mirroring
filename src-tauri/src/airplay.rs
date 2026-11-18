@@ -4,7 +4,9 @@
 
 use std::convert::Infallible;
 use std::error::Error;
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+use std::path::Path;
 use std::ffi::c_int;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -12,7 +14,8 @@ use std::time::Instant;
 
 use crate::h264::low_latency_sps;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
-use rairplay::config::{Config, DefaultKeychain, Features, Keychain, MacAddr6, Pairing, Video};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use rairplay::config::{Config, Features, Keychain, MacAddr6, Pairing, Video};
 use rairplay::playback::audio::{AudioDevice, AudioPacket, AudioParams, CodecKind};
 use rairplay::playback::video::{PacketKind, VideoDevice, VideoPacket, VideoParams};
 use rairplay::playback::{ChannelHandle, Device, Stream};
@@ -265,6 +268,66 @@ impl Stream for AudioSink {
     fn on_err(self, _err: Box<dyn Error>) {}
 }
 
+/// Identitas AirPlay milik instalasi ini. Kunci privatnya dibuat acak saat pertama dijalankan dan
+/// disimpan di folder data app, jadi tiap PC punya identitas sendiri yang tetap antar-sesi.
+pub struct DeviceKeychain {
+    id: Vec<u8>,
+    key: SigningKey,
+    public: VerifyingKey,
+    // shortcut: perangkat tepercaya hanya diingat selama app hidup. Cukup untuk pairing legacy tanpa PIN;
+    // simpan ke disk kalau pairing HomeKit/PIN diaktifkan.
+    trusted: Mutex<HashMap<Vec<u8>, VerifyingKey>>,
+}
+
+impl DeviceKeychain {
+    /// Memuat kunci dari `path`, atau membuat yang baru kalau belum ada atau rusak.
+    pub fn load(path: &Path, id: &[u8]) -> Self {
+        let seed: [u8; 32] = std::fs::read(path).ok().and_then(|b| b.try_into().ok()).unwrap_or_else(|| {
+            let mut seed = [0u8; 32];
+            getrandom::fill(&mut seed).expect("sumber acak sistem operasi tidak tersedia");
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            // Gagal menyimpan tidak fatal: app tetap jalan, hanya identitasnya berganti di sesi berikutnya.
+            let _ = std::fs::write(path, seed);
+            seed
+        });
+        let key = SigningKey::from_bytes(&seed);
+        Self { id: id.to_vec(), public: key.verifying_key(), key, trusted: Mutex::default() }
+    }
+}
+
+impl Keychain for DeviceKeychain {
+    fn id(&self) -> &[u8] {
+        &self.id
+    }
+
+    fn pubkey(&self) -> &[u8] {
+        self.public.as_bytes()
+    }
+
+    fn sign(&self, data: &[u8]) -> Vec<u8> {
+        self.key.sign(data).to_bytes().to_vec()
+    }
+
+    fn trust(&self, id: &[u8], key: &[u8]) -> bool {
+        let Some(key) = key.try_into().ok().and_then(|k| VerifyingKey::from_bytes(k).ok()) else { return false };
+        let mut trusted = self.trusted.lock().unwrap();
+        // Batas supaya perangkat di jaringan tidak bisa mengisi memori dengan identitas palsu.
+        if trusted.len() >= 32 && !trusted.contains_key(id) {
+            return false;
+        }
+        trusted.insert(id.to_vec(), key);
+        true
+    }
+
+    fn verify(&self, id: &[u8], message: &[u8], signature: &[u8]) -> bool {
+        let trusted = self.trusted.lock().unwrap();
+        let (Some(key), Ok(signature)) = (trusted.get(id), Signature::from_slice(signature)) else { return false };
+        key.verify_strict(message, &signature).is_ok()
+    }
+}
+
 pub struct Sink(Arc<AirPlay>);
 
 impl Device for Sink {
@@ -403,12 +466,10 @@ fn advertise(name: &str, mac: [u8; 6], features: u64, pubkey: &[u8]) -> Result<S
 }
 
 /// Dipanggil sekali saat app mulai. Kegagalan (mis. port 7000 terpakai) dicatat di `status`, app tetap jalan.
-pub async fn serve(state: Arc<AirPlay>) {
+pub async fn serve(state: Arc<AirPlay>, key_path: std::path::PathBuf) {
     let name = device_name();
     let mac = device_mac(&name);
-    // shortcut: DefaultKeychain memakai kunci identitas bawaan yang sama di semua PC dan tidak menyimpan
-    // perangkat tepercaya; ganti dengan Keychain persisten sebelum fitur iPhone dianggap siap rilis.
-    let keychain = DefaultKeychain::default();
+    let keychain = DeviceKeychain::load(&key_path, hex(&mac).as_bytes());
     let pubkey = keychain.pubkey().to_vec();
     // Mode audio tersangga (AirPlay 2) tidak diiklankan: app memutar suara real-time, tanpa penyangga panjang.
     // Terukur di iPhone: suara mirroring tetap datang sebagai AAC-LC 1024 sampel, tiap paket dikirim 3 kali.
@@ -462,6 +523,27 @@ mod tests {
         assert_eq!(nals_to_annexb(&idr, 4).unwrap(), (vec![0, 0, 0, 1, 0x65, 0xaa, 0, 0, 0, 1, 0x06], true));
         assert!(!nals_to_annexb(&[0, 0, 0, 1, 0x41], 4).unwrap().1);
         assert!(nals_to_annexb(&[0, 0, 0, 9, 0x41], 4).is_none()); // panjang melebihi data
+    }
+
+    #[test]
+    fn keychain_is_unique_per_install_and_persists() {
+        let dir = std::env::temp_dir().join(format!("sm-keychain-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let a = DeviceKeychain::load(&dir.join("a/airplay.key"), b"id");
+        let again = DeviceKeychain::load(&dir.join("a/airplay.key"), b"id");
+        let other = DeviceKeychain::load(&dir.join("b/airplay.key"), b"id");
+        assert_eq!(a.pubkey(), again.pubkey());
+        assert_ne!(a.pubkey(), other.pubkey());
+        assert_ne!(a.pubkey(), SigningKey::from_bytes(&[5; 32]).verifying_key().as_bytes()); // bukan kunci bawaan lama
+
+        // Tanda tangan perangkat tepercaya diterima; yang tak dikenal atau diubah ditolak.
+        assert!(a.trust(b"peer", other.pubkey()));
+        let sig = other.sign(b"halo");
+        assert!(a.verify(b"peer", b"halo", &sig));
+        assert!(!a.verify(b"peer", b"halo!", &sig));
+        assert!(!a.verify(b"asing", b"halo", &sig));
+        assert!(!a.trust(b"rusak", &[1, 2, 3]));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

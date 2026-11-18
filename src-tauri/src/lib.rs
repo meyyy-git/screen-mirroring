@@ -324,7 +324,8 @@ pub fn run() {
             }
             let airplay = Arc::new(airplay::AirPlay::default());
             app.manage(airplay.clone());
-            tauri::async_runtime::spawn(airplay::serve(airplay));
+            let key_path = app.path().app_data_dir()?.join("airplay.key");
+            tauri::async_runtime::spawn(airplay::serve(airplay, key_path));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
