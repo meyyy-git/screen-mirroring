@@ -26,6 +26,7 @@
     "targets": ["nsis"],
     "resources": {
       "resources/scrcpy-server": "resources/scrcpy-server",
+      "resources/scrcpy-LICENSE.txt": "resources/scrcpy-LICENSE.txt",
       "resources/adb/*": "resources/adb/",
       "vendor/ffmpeg/bin/avcodec-62.dll": "avcodec-62.dll",
       "vendor/ffmpeg/bin/avutil-60.dll": "avutil-60.dll",
